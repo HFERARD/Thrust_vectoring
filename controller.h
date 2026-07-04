@@ -1,10 +1,5 @@
 #pragma once
 
-// This file is header to define PID controller
-// (No IMU library is needed here -- this is a pure PID class. The IMU library
-//  is included once in sensor.h. Including a second/different IMU library here
-//  clashes with the global `IMU` object declared by sensor.h.)
-
 class PID_controller
 {
 public:
@@ -71,7 +66,7 @@ public:
             }
             else
             {
-                total_error = candidate_integral; // commit the integral only when unsaturated
+                total_error = candidate_integral;
             }
 
             last_error = error;
@@ -84,6 +79,6 @@ public:
         total_error = 0;
         last_error = 0;
         control_signal = 0;
-        initialized = false; // force dt re-seeding on the next activation
+        initialized = false;
     }
 };

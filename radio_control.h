@@ -47,11 +47,6 @@ public:
             pitchCommand = constrain((rcPitch - 1500) * (maxPitch / 500.0), -maxPitch, maxPitch);
             throttleCommand = constrain((rcThrottle - 1000) / 10.0, 0.0, 100.0);
 
-            // Diagnostic: cnt_rec is the number of valid iBus frames the library
-            // has actually decoded. If it stays 0 the receiver is NOT reaching
-            // Serial1/D0 (wiring or receiver not in iBus mode) -- not a code bug.
-            // If it climbs but the raw channels stay at 0, the frames are being
-            // read but the channel mapping/receiver output is off.
             Serial.print("RC frames=");
             Serial.print(IBus.cnt_rec);
             Serial.print(" raw ch0/1/2=");
