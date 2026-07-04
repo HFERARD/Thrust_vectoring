@@ -22,11 +22,19 @@ namespace espp
         float alpha;
         float pitch = 0.0f, roll = 0.0f;
 
+        // Level-reference offsets. The estimated angle converges to the
+        // accelerometer angle at rest, which is non-zero whenever the IMU is
+        // not perfectly level (mounting tilt / zero-g bias). These offsets are
+        // captured once at a known-level position and subtracted on output so
+        // "flat" reads 0. NOTE: gyro-bias calibration does NOT remove this --
+        // it only affects the integrated gyro term, not the steady-state angle.
+        float pitchOffset = 0.0f, rollOffset = 0.0f;
+
         unsigned long last_time = 0;
         bool initialized = false;
 
     public:
-        explicit ComplementaryFilter(float alpha = 0.98f)
+        explicit ComplementaryFilter(float alpha = 0.5f)
             : alpha(alpha) {}
 
         void update(Acceleration &acc, RotationVelocity &gyr)
@@ -42,7 +50,6 @@ namespace espp
             }
 
             // millis() returns ms -- convert the delta to seconds so it
-            // matches the gyro units (deg/s) used below.
             float dt = (current_time - last_time) / 1000.0f;
             last_time = current_time;
 
@@ -63,8 +70,14 @@ namespace espp
             roll = alpha * gyroRoll + (1 - alpha) * accelRoll;
         }
 
-        float get_pitch() const { return pitch; }
+        void zeroFromAccel(float ax, float ay, float az)
+        {
+            pitchOffset = atan2f(ay, sqrtf(ax * ax + az * az)) * 180.0f / (float)M_PI;
+            rollOffset = atan2f(-ax, az) * 180.0f / (float)M_PI;
+        }
 
-        float get_roll() const { return roll; }
+        float get_pitch() const { return pitch - pitchOffset; }
+
+        float get_roll() const { return roll - rollOffset; }
     };
 }

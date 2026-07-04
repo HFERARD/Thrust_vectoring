@@ -11,7 +11,11 @@ public:
 
     OpenServoController(int pin) : PIN(pin)
     {
-        servo.attach(PIN);
+    }
+
+    void begin()
+    {
+        servo.attach(PIN); // Attach servo to pin
     }
 
     void control(double control_position)
@@ -20,38 +24,76 @@ public:
     }
 };
 
-// class OpenBrushlessController
-// {
-// private:
-//     bool activated = true;
-//     int min_throttle = 1000;
-//     int max_throttle = 2000;
+// This code should be updated, there is shared code with servo controllers that should be joined
 
-// public:
-//     OpenServoController servo;
+class OpenBrushlessController
+{
+private:
+    int PIN;
+    bool activated = false;
+    int min_throttle = 1000;
+    int max_throttle = 2000;
+    float throttle = 0;
 
-//     ServoControllerPID(int pin) : servo(pin)
-//     {
-//         deactivate();
-//     }
+public:
+    Servo esc; // Electronic Speed Controller (ESC) for brushless motor
 
-//     void activate()
-//     {
-//         activated = true;
-//     }
+    OpenBrushlessController(int pin) : PIN(pin)
+    {
+    }
 
-//     void deactivate()
-//     {
-//         activated = false;
-//         servo.control(90); // Set servo to neutral position
-//         pid.reset();
-//     }
-// }
+    void begin()
+    {
+        esc.attach(PIN, min_throttle, max_throttle);
+        deactivate();
+        delay(3000);
+    }
+
+    void activate()
+    {
+        activated = true;
+    }
+
+    void deactivate()
+    {
+        setThrottle(0); // Set throttle to 0%
+        activated = false;
+    }
+
+    void control()
+    {
+        if (!activated) // Check activation status before controlling the ESC
+            return;
+        esc.writeMicroseconds(min_throttle + (max_throttle - min_throttle) * throttle);
+    }
+
+    void control(float percentage)
+    {
+        if (!activated) // Check activation status before controlling the ESC
+            return;
+        setThrottle(percentage);
+        esc.writeMicroseconds(min_throttle + (max_throttle - min_throttle) * throttle);
+    }
+
+    void setThrottle(float percentage)
+    {
+        if (!activated) // Check activation status before setting throttle
+            return;
+        throttle = percentage / 100.0f; // Convert to 0.0 - 1.0 range
+    }
+
+    float getThrottle()
+    {
+        if (!activated) // Check activation status before getting throttle
+            return 0;
+        return throttle * 100.0f; // Convert to 0.0 - 100.0 range
+    }
+};
 
 class ServoControllerPID
 {
 private:
-    bool activated = true;
+    bool activated = false;
 
 public:
     OpenServoController servo;
@@ -59,7 +101,12 @@ public:
 
     ServoControllerPID(int pin, int max_control, int min_control) : servo(pin), pid(max_control, min_control)
     {
-        deactivate();
+    }
+
+    void begin()
+    {
+        servo.begin();
+        deactivate(); // Set servo to neutral position and reset PID
     }
 
     void control(double command_value, double sensed_output)

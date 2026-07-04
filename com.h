@@ -15,13 +15,17 @@ class SerialHandler
     bool SRO = true; // Servo roll command
     bool PIT = true; // Estimated pitch angle
     bool SPI = true; // Servo pitch command
+    bool THR = true; // Brushless throttle command
+    bool DA1 = true; // Extra data for testing
+    bool DA2 = true; // Extra data for testing
 
 private:
     // This class handles all outgoing communication to the nano board
     GyroscopeAccelerometer &imu;
-    ServoControllerPID &servoRoll;  // index 1
-    ServoControllerPID &servoPitch; // index 2
-    // ServoControllerPID &brushlessPID; // index 3
+
+    ServoControllerPID &servoRoll;      // index 1
+    ServoControllerPID &servoPitch;     // index 2
+    OpenBrushlessController &brushless; // index 3
 
     int digitsACCprecision = 5;
     int digitsGYRprecision = 5;
@@ -29,12 +33,16 @@ private:
     int digitsPITprecision = 5;
     int digitsSROprecision = 5;
     int digitsSPIprecision = 5;
+    int digitsTHRprecision = 5;
+    int digitsDA1precision = 5;
+    int digitsDA2precision = 5;
 
 public:
     SerialHandler(GyroscopeAccelerometer &imu,
                   ServoControllerPID &servoRoll,
-                  ServoControllerPID &servoPitch)
-        : imu(imu), servoRoll(servoRoll), servoPitch(servoPitch)
+                  ServoControllerPID &servoPitch,
+                  OpenBrushlessController &brushless)
+        : imu(imu), servoRoll(servoRoll), servoPitch(servoPitch), brushless(brushless)
     {
     }
 
@@ -85,6 +93,27 @@ public:
             //  ptr = &brushlessPID;
             //    break;
 
+        case 3:
+            if (cmd[0] == 'v') // Brushless controller does not have PID parameters to set
+            {
+                brushless.setThrottle(val);
+                return;
+            }
+            else if (cmd[0] == '+' || cmd[0] == '-') // Activate or deactivate brushless controller
+            {
+                if (cmd[0] == '+')
+                    brushless.activate();
+                else
+                    brushless.deactivate();
+                return;
+            }
+            else
+            {
+                Serial.print("unknown cmd for brushless: ");
+                Serial.println(cmd);
+                return;
+            }
+            break;
         default:
             Serial.print("unknown motor index: ");
             Serial.println(motor);
@@ -115,6 +144,7 @@ public:
         case '-': // Deactivate all
             ptr->deactivate();
             break;
+
         case '?': // Print all parameters
             Serial.print("Kp=");
             Serial.print(ptr->pid.Kp);
@@ -134,7 +164,7 @@ public:
         }
     }
 
-    void sendData(float roll, float pitch, float rollCommand, float pitchCommand, Acceleration &acc, RotationVelocity &gyr)
+    void sendData(float roll, float pitch, float rollCommand, float pitchCommand, Acceleration &acc, RotationVelocity &gyr, float throttleCommand, float data1 = 0.0, float data2 = 0.0)
     {
         unsigned long current_time = millis(); // returns the number of milliseconds passed since the Arduino started running the program
 
@@ -194,6 +224,24 @@ public:
         {
             Serial.print("SPI ");
             Serial.println(pitchCommand, digitsSPIprecision);
+        }
+
+        if (THR)
+        {
+            Serial.print("THR ");
+            Serial.println(throttleCommand, digitsTHRprecision);
+        }
+
+        if (DA1)
+        {
+            Serial.print("DA1 ");
+            Serial.println(data1, digitsDA1precision);
+        }
+
+        if (DA2)
+        {
+            Serial.print("DA2 ");
+            Serial.println(data2, digitsDA2precision);
         }
     }
 };

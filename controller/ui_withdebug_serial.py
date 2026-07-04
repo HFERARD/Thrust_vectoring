@@ -1,15 +1,13 @@
 """
-Vectored Thrust PID Tuner
---------------------------
-PyQt5 UI to tune 2 independent PID controllers over Bluetooth Low Energy (BLE)
-communicating with an Arduino Nano 33 BLE.
+Vectored Thrust PID Tuner  (Serial edition)
+-------------------------------------------
+PyQt5 UI to tune 2 independent PID controllers over Serial
+communicating with an Arduino Nano BLE Sense Rev2.
 
-The board exposes a Nordic-UART-Service (NUS): a text-line protocol identical to
-the old USB-serial link, just carried over two BLE characteristics instead of a
-COM port. The RX characteristic receives command lines; the TX characteristic
-notifies telemetry/replies.
+This is the USB-serial (COM port) version. For the Bluetooth Low Energy
+version, see ui_withdebug.py.
 
-Protocol (Python -> Arduino, written to the RX characteristic):
+Serial protocol (Python -> Arduino):
     'p <motor> <val>\\n'     set Kp       motor: 1=Roll, 2=Pitch
     'i <motor> <val>\\n'     set Ki
     'd <motor> <val>\\n'     set Kd
@@ -23,7 +21,7 @@ Gains are NOT sent live as sliders move. Use each panel's "Send" button to push
 the slider values to the device, and "Query" to pull the device's real values
 back into the sliders.
 
-Protocol (Arduino -> Python, notified on the TX characteristic):
+Serial protocol (Arduino -> Python):
     'ACC <ax>,<ay>,<az>\\n'  raw accelerometer (g)
     'GYR <gx>,<gy>,<gz>\\n'  raw gyroscope (deg/s)
     'ROL <roll>\\n'          estimated roll angle (deg)
@@ -31,18 +29,20 @@ Protocol (Arduino -> Python, notified on the TX characteristic):
     'SRO <rollCommand>\\n'   servo roll command
     'SPI <pitchCommand>\\n'  servo pitch command
     'THR <throttle>\\n'      brushless throttle actually running (0..100 %)
+    'DA1 <value>\\n'         extra debug data channel 1 (single float)
+    'DA2 <value>\\n'         extra debug data channel 2 (single float)
 
 Install dependencies:
-    pip install bleak PyQt5 pyqtgraph
+    pip install pyserial PyQt5 pyqtgraph
 """
 
 import sys
 import time
-import asyncio
 import threading
 from collections import deque
 
-from bleak import BleakClient, BleakScanner
+import serial
+import serial.tools.list_ports
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -63,13 +63,7 @@ except ImportError:
 #  CONFIGURATION
 # ─────────────────────────────────────────────
 
-# ── BLE Nordic-UART-Service, must match com_ble.h on the Arduino ──
-BLE_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
-BLE_RX_UUID      = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"  # Python writes commands here
-BLE_TX_UUID      = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"  # board notifies telemetry here
-BLE_DEVICE_NAME  = "MotorControl"  # local name advertised by the board
-BLE_SCAN_SECONDS = 4.0
-
+BAUD_RATE   = 115200
 PLOT_WINDOW = 200
 UPDATE_MS   = 50
 RAW_LOG_MAX_LINES = 300   # cap the debug console so it doesn't grow forever
@@ -101,124 +95,81 @@ ATT_CHANNELS = [
     ("SPI", "pitch cmd", "#4FC3F7", True),   # servo pitch command
 ]
 
+# Extra debug data channels: (serial key, legend label, color)
+# Single float per line ('DA1 <value>' / 'DA2 <value>'), meant for ad-hoc
+# testing/telemetry. Both are drawn on the same plot.
+DAT_CHANNELS = [
+    ("DA1", "data 1", "#F06292"),
+    ("DA2", "data 2", "#BA68C8"),
+]
+
 # ─────────────────────────────────────────────
-#  BLE WORKER
+#  SERIAL WORKER
 # ─────────────────────────────────────────────
 
-class BLEWorker(QObject):
-    """
-    Same public surface as the old SerialWorker (connect/disconnect/send_gain/
-    send_action + telemetry_received/connection_changed signals), but talks to
-    the board over BLE using bleak.
-
-    bleak is asyncio-based while the UI runs the Qt event loop, so a private
-    asyncio loop is spun up on a daemon thread. Every public method just hands a
-    coroutine to that loop via run_coroutine_threadsafe; results come back to the
-    UI thread through Qt signals (queued automatically across threads).
-    """
+class SerialWorker(QObject):
     telemetry_received = pyqtSignal(str)   # every raw line, parsed or not
     connection_changed = pyqtSignal(bool)
-    devices_found      = pyqtSignal(list)  # [(label, address), ...] from a scan
 
     def __init__(self):
         super().__init__()
-        self._client   = None
-        self._rx_buf   = ""      # reassembles '\n'-delimited lines from notifications
-        self._loop     = asyncio.new_event_loop()
-        self._thread   = threading.Thread(target=self._run_loop, daemon=True)
-        self._thread.start()
+        self._ser       = None
+        self._running   = False
+        self._cmd_queue = []
+        self._lock      = threading.Lock()
 
-    def _run_loop(self):
-        asyncio.set_event_loop(self._loop)
-        self._loop.run_forever()
-
-    def _submit(self, coro):
-        """Schedule a coroutine on the BLE thread from the Qt thread."""
-        return asyncio.run_coroutine_threadsafe(coro, self._loop)
-
-    # ── scanning ──────────────────────────────────────────────────────────
-
-    def scan(self):
-        self._submit(self._scan())
-
-    async def _scan(self):
+    def connect(self, port: str):
+        self.disconnect()
         try:
-            devices = await BleakScanner.discover(timeout=BLE_SCAN_SECONDS)
-        except Exception:
-            self.devices_found.emit([])
-            return
-        # Advertise our target first if present, then everything else. Named
-        # devices are more useful than a wall of anonymous MACs, so list them first.
-        found = []
-        for d in devices:
-            name = d.name or "unknown"
-            found.append((f"{name}  [{d.address}]", d.address))
-        found.sort(key=lambda x: (BLE_DEVICE_NAME not in x[0], "unknown" in x[0], x[0]))
-        self.devices_found.emit(found)
-
-    # ── connection ────────────────────────────────────────────────────────
-
-    def connect(self, address: str):
-        self._submit(self._connect(address))
-
-    async def _connect(self, address: str):
-        await self._disconnect()
-        try:
-            self._client = BleakClient(address, disconnected_callback=self._on_disconnected)
-            await self._client.connect()
-            await self._client.start_notify(BLE_TX_UUID, self._on_notify)
+            self._ser     = serial.Serial(port, BAUD_RATE, timeout=0.1)
+            self._running = True
+            threading.Thread(target=self._loop, daemon=True).start()
+            time.sleep(2)   # allow Arduino reset
             self.connection_changed.emit(True)
-        except Exception:
-            self._client = None
+        except serial.SerialException as e:
             self.connection_changed.emit(False)
+            raise e
 
     def disconnect(self):
-        self._submit(self._disconnect())
-
-    async def _disconnect(self):
-        if self._client is not None:
-            try:
-                if self._client.is_connected:
-                    await self._client.disconnect()
-            except Exception:
-                pass
-            self._client = None
+        self._running = False
+        if self._ser and self._ser.is_open:
+            self._ser.close()
+        self._ser = None
         self.connection_changed.emit(False)
-
-    def _on_disconnected(self, _client):
-        # Fired by bleak's own thread when the link drops unexpectedly.
-        self._client = None
-        self.connection_changed.emit(False)
-
-    # ── data flow ─────────────────────────────────────────────────────────
-
-    def _on_notify(self, _char, data: bytearray):
-        """A TX notification arrived — the board sends telemetry in small chunks,
-        so reassemble the byte stream and emit one signal per complete line."""
-        self._rx_buf += data.decode("utf-8", errors="ignore")
-        while "\n" in self._rx_buf:
-            line, self._rx_buf = self._rx_buf.split("\n", 1)
-            line = line.strip()
-            if line:
-                self.telemetry_received.emit(line)
 
     def send_gain(self, cmd: str, motor: int, value: float):
-        self._write(f"{cmd} {motor} {value:.4f}\n")
+        with self._lock:
+            self._cmd_queue.append(f"{cmd} {motor} {value:.4f}\n")
 
     def send_action(self, cmd: str, motor: int):
-        self._write(f"{cmd} {motor}\n")
+        with self._lock:
+            self._cmd_queue.append(f"{cmd} {motor}\n")
 
-    def _write(self, text: str):
-        self._submit(self._write_async(text))
+    def _loop(self):
+        while self._running and self._ser and self._ser.is_open:
+            # flush outgoing commands first
+            with self._lock:
+                cmds, self._cmd_queue = self._cmd_queue, []
+            for c in cmds:
+                try:
+                    self._ser.write(c.encode())
+                except serial.SerialException:
+                    self._running = False
+                    self.connection_changed.emit(False)
+                    return
 
-    async def _write_async(self, text: str):
-        if self._client is None or not self._client.is_connected:
-            return
-        try:
-            # write-without-response mirrors a serial write: fire-and-forget, no ack
-            await self._client.write_gatt_char(BLE_RX_UUID, text.encode(), response=False)
-        except Exception:
-            pass
+            # read every line currently buffered, not just one —
+            # prevents falling behind if the Arduino sends fast bursts
+            try:
+                while self._ser.in_waiting:
+                    raw = self._ser.readline()
+                    line = raw.decode("utf-8", errors="ignore").strip()
+                    if line:
+                        self.telemetry_received.emit(line)
+            except serial.SerialException:
+                self._running = False
+                self.connection_changed.emit(False)
+                return
 
 # ─────────────────────────────────────────────
 #  GAIN SLIDER
@@ -567,21 +518,38 @@ def make_imu_plot():
     pg.setConfigOptions(antialias=True, background="#0d0d1a", foreground="#555580")
 
     layout = pg.GraphicsLayoutWidget()
+    # a little breathing room between the four plots so they don't read as
+    # one cramped stack
+    layout.ci.layout.setSpacing(14)
+    layout.ci.setContentsMargins(6, 6, 6, 6)
 
-    acc_plot = layout.addPlot(row=0, col=0, title="Accelerometer (g)")
-    acc_plot.showGrid(x=True, y=True, alpha=0.15)
-    acc_plot.addLegend(offset=(10, 10))
-    acc_plot.setLabel("left", "g")
+    def add_plot(row, col, title, y_unit, bottom):
+        """Create one styled plot. Only the bottom row of the grid shows the
+        'samples' x-axis label so the middle gridlines stay clean."""
+        p = layout.addPlot(row=row, col=col, title=title)
+        p.showGrid(x=True, y=True, alpha=0.15)
+        # legend anchored top-left, inside the view, semi-transparent so it
+        # never hides the traces
+        legend = p.addLegend(offset=(8, 8), labelTextSize="7pt")
+        legend.setBrush(pg.mkBrush(13, 13, 26, 180))
+        p.setLabel("left", y_unit)
+        if bottom:
+            p.setLabel("bottom", "samples")
+        p.getAxis("left").setWidth(42)   # align y-axes across the grid
+        return p
 
-    gyr_plot = layout.addPlot(row=1, col=0, title="Gyroscope (°/s)")
-    gyr_plot.showGrid(x=True, y=True, alpha=0.15)
-    gyr_plot.addLegend(offset=(10, 10))
-    gyr_plot.setLabel("left", "°/s")
+    # 2×2 grid: raw sensors on the left column, derived signals on the right.
+    #   ┌ Accelerometer ┬ Attitude ┐
+    #   └ Gyroscope     ┴ Extra    ┘
+    acc_plot = add_plot(0, 0, "Accelerometer (g)",              "g",     False)
+    att_plot = add_plot(0, 1, "Attitude — angle vs command (°)", "°",     False)
+    gyr_plot = add_plot(1, 0, "Gyroscope (°/s)",                "°/s",   True)
+    dat_plot = add_plot(1, 1, "Extra Data (DA1 / DA2)",         "value", True)
 
-    att_plot = layout.addPlot(row=2, col=0, title="Attitude — angle vs command (°)")
-    att_plot.showGrid(x=True, y=True, alpha=0.15)
-    att_plot.addLegend(offset=(10, 10))
-    att_plot.setLabel("left", "°")
+    # all plots share the same x scale (sample index) — link them so panning
+    # or zooming one scrolls them all together
+    for p in (att_plot, gyr_plot, dat_plot):
+        p.setXLink(acc_plot)
 
     curves = {}
     labels = ["x", "y", "z"]
@@ -596,6 +564,10 @@ def make_imu_plot():
         curves[key] = att_plot.plot([], [], name=label,
             pen=pg.mkPen(color=color, width=2, style=style))
 
+    for key, label, color in DAT_CHANNELS:
+        curves[key] = dat_plot.plot([], [], name=label,
+            pen=pg.mkPen(color=color, width=2))
+
     return layout, curves
 
 # ─────────────────────────────────────────────
@@ -607,21 +579,24 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Vectored Thrust — PID Tuner")
-        self.setMinimumSize(1040, 720)
+        self.setMinimumSize(1280, 900)
+        # start with a generous default size so the plots get plenty of
+        # vertical room; the y-axes read much more clearly when taller
+        self.resize(1600, 1000)
 
-        self._worker = BLEWorker()
+        self._worker = SerialWorker()
         self._worker.telemetry_received.connect(self._on_telemetry)
         self._worker.connection_changed.connect(self._on_connection)
-        self._worker.devices_found.connect(self._on_devices_found)
 
         self._imu_buffers = {
             f"{src}_{ax}": deque([0.0] * PLOT_WINDOW, maxlen=PLOT_WINDOW)
             for src in ["ACC", "GYR"] for ax in ["x", "y", "z"]
         }
         # single-value attitude channels (roll/pitch angle + servo commands)
+        # plus the extra 'DAT' debug channel — all single float per line.
         self._imu_buffers.update({
             key: deque([0.0] * PLOT_WINDOW, maxlen=PLOT_WINDOW)
-            for key, *_ in ATT_CHANNELS
+            for key, *_ in ATT_CHANNELS + DAT_CHANNELS
         })
 
         # ── diagnostics state ───────────────────────────────────────────
@@ -692,7 +667,7 @@ class MainWindow(QMainWindow):
 
         if HAS_PYQTGRAPH:
             self._plot_widget, self._curves = make_imu_plot()
-            right_layout.addWidget(self._plot_widget, stretch=3)
+            right_layout.addWidget(self._plot_widget, stretch=5)
         else:
             no_plot = QLabel("Install pyqtgraph for live IMU plot\n\npip install pyqtgraph")
             no_plot.setAlignment(Qt.AlignCenter)
@@ -712,7 +687,7 @@ class MainWindow(QMainWindow):
         self._status.showMessage("Not connected")
 
     def _build_debug_console(self):
-        box = QGroupBox("Raw BLE  (debug)")
+        box = QGroupBox("Raw Serial  (debug)")
         box.setFont(QFont("Segoe UI", 9, QFont.Bold))
         box.setStyleSheet("""
             QGroupBox {
@@ -766,14 +741,14 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(10, 4, 10, 4)
         layout.setSpacing(8)
 
-        lbl = QLabel("DEVICE")
+        lbl = QLabel("PORT")
         lbl.setStyleSheet("color: #555580; font-size: 9px; letter-spacing: 2px;")
         lbl.setFont(QFont("Consolas", 9))
         layout.addWidget(lbl)
 
-        self._device_combo = QComboBox()
-        self._device_combo.setFixedWidth(260)
-        self._device_combo.setStyleSheet("""
+        self._port_combo = QComboBox()
+        self._port_combo.setFixedWidth(200)
+        self._port_combo.setStyleSheet("""
             QComboBox {
                 background: #1e1e2e; color: #e0e0f0;
                 border: 1px solid #3a3a5a; border-radius: 4px; padding: 2px 8px;
@@ -783,13 +758,13 @@ class MainWindow(QMainWindow):
                 selection-background-color: #3a3a6a;
             }
         """)
-        self._device_combo.addItem("Click ↻ to scan for BLE devices", None)
-        layout.addWidget(self._device_combo)
+        self._refresh_ports()
+        layout.addWidget(self._port_combo)
 
         refresh_btn = QPushButton("↻")
         refresh_btn.setFixedSize(30, 28)
-        refresh_btn.setToolTip("Scan for BLE devices")
-        refresh_btn.clicked.connect(self._scan_devices)
+        refresh_btn.setToolTip("Refresh port list")
+        refresh_btn.clicked.connect(self._refresh_ports)
         refresh_btn.setStyleSheet(self._btn_style("#3a3a5a"))
         layout.addWidget(refresh_btn)
 
@@ -828,52 +803,36 @@ class MainWindow(QMainWindow):
             }
         """)
 
-    # ── device management ────────────────────────────────────────────────
+    # ── port management ──────────────────────────────────────────────────
 
-    def _scan_devices(self):
-        self._device_combo.clear()
-        self._device_combo.addItem("Scanning…", None)
-        self._status.showMessage("Scanning for BLE devices…")
-        self._worker.scan()
-
-    def _on_devices_found(self, devices):
-        self._device_combo.clear()
-        if not devices:
-            self._device_combo.addItem("No devices found", None)
-            self._status.showMessage("No BLE devices found — is the board powered and advertising?")
-            return
-        for label, address in devices:
-            self._device_combo.addItem(label, address)
-        # Preselect our board if it showed up, so the user can just hit Connect.
-        for i in range(self._device_combo.count()):
-            if BLE_DEVICE_NAME in self._device_combo.itemText(i):
-                self._device_combo.setCurrentIndex(i)
-                break
-        self._status.showMessage(f"Found {len(devices)} device(s)")
+    def _refresh_ports(self):
+        self._port_combo.clear()
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        self._port_combo.addItems(ports if ports else ["No ports found"])
 
     def _toggle_connection(self):
         if self._connect_btn.text() == "Connect":
-            address = self._device_combo.currentData()
-            if not address:
-                self._status.showMessage("No BLE device selected — scan and pick one first.")
+            port = self._port_combo.currentText()
+            if not port or port == "No ports found":
+                self._status.showMessage("No serial port selected.")
                 return
-            self._status.showMessage("Connecting…")
-            self._rx_count = self._rx_parsed = self._rx_unparsed = 0
-            # Button state is finalised in _on_connection once the async
-            # connect succeeds or fails (BLE connect is not instantaneous).
-            self._worker.connect(address)
+            try:
+                self._worker.connect(port)
+                self._connect_btn.setText("Disconnect")
+                self._connect_btn.setStyleSheet(self._btn_style("#ef5350"))
+                self._rx_count = self._rx_parsed = self._rx_unparsed = 0
+            except serial.SerialException as e:
+                self._status.showMessage(f"Connection failed: {e}")
         else:
             self._worker.disconnect()
+            self._connect_btn.setText("Connect")
+            self._connect_btn.setStyleSheet(self._btn_style("#4FC3F7"))
 
     def _on_connection(self, connected):
         if connected:
-            self._connect_btn.setText("Disconnect")
-            self._connect_btn.setStyleSheet(self._btn_style("#ef5350"))
             self._dot.setStyleSheet("color: #81C784;")
-            self._status.showMessage(f"Connected — {self._device_combo.currentText()}")
+            self._status.showMessage(f"Connected — {self._port_combo.currentText()}")
         else:
-            self._connect_btn.setText("Connect")
-            self._connect_btn.setStyleSheet(self._btn_style("#4FC3F7"))
             self._dot.setStyleSheet("color: #ef5350;")
             self._status.showMessage("Disconnected")
 
@@ -1043,5 +1002,5 @@ if __name__ == "__main__":
     app.setPalette(palette)
 
     window = MainWindow()
-    window.show()
+    window.showMaximized()
     sys.exit(app.exec_())
